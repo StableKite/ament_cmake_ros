@@ -29,6 +29,7 @@ extern "C"
 /**
  * Perform neccessary changes to the process and/or environment so that any
  * attempted ROS communication will be isolated from other processes.
+ * Call before starting other code that writes the process environment.
  *
  * \return `RMW_RET_OK` if successful, or
  * \return `RMW_RET_ERROR` if an unexpected error occurs.
@@ -42,6 +43,7 @@ rmw_test_isolation_start();
 /**
  * Restore the process and/or environment to the previous state and deallocate
  * any resources previously allocated by rmw_test_isolation_start().
+ * Stop other code that writes the process environment before calling.
  *
  * \return `RMW_RET_OK` if successful, or
  * \return `RMW_RET_ERROR` if an unexpected error occurs.

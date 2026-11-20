@@ -81,7 +81,7 @@ install(
 
 ament_python_install_package(${PROJECT_NAME})
 
-python3_add_library(_rmw_test_fixture_implementation
+python3_add_library(_rmw_test_fixture_implementation MODULE WITH_SOABI
   src/rmw_test_fixture_implementation_py.c
 )
 

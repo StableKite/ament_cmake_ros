@@ -22,6 +22,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -42,6 +43,7 @@ static rmw_ret_t (*symbol_rmw_test_isolation_start)() = rmw_test_isolation_init;
 static rmw_ret_t (*symbol_rmw_test_isolation_stop)() = rmw_test_isolation_stop_noop;
 
 static std::map<std::string, std::unique_ptr<rcpputils::SharedLibrary>> g_isolation_libs;
+static std::mutex g_isolation_mutex;
 
 static
 rmw_ret_t
@@ -136,12 +138,14 @@ extern "C"
 rmw_ret_t
 rmw_test_isolation_start()
 {
+  std::lock_guard<std::mutex> lock(g_isolation_mutex);
   return symbol_rmw_test_isolation_start();
 }
 
 rmw_ret_t
 rmw_test_isolation_stop()
 {
+  std::lock_guard<std::mutex> lock(g_isolation_mutex);
   rmw_ret_t ret = symbol_rmw_test_isolation_stop();
 
   symbol_rmw_test_isolation_start = rmw_test_isolation_init;

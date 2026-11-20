@@ -26,6 +26,85 @@
 #include <rmw/convert_rcutils_ret_to_rmw_ret.h>
 #include <rmw_test_fixture/rmw_test_fixture.h>
 
+#if PY_VERSION_HEX >= 0x030E0000
+
+static PyMutex isolation_mutex;
+
+static int update_environment_cache(PyObject *data, PyObject *snapshot)
+{
+  int result = -1;
+  Py_BEGIN_CRITICAL_SECTION(data);
+  PyObject *keys = PyDict_Keys(data);
+  if (keys) {
+    result = 0;
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(keys); ++i) {
+      PyObject *key = PyList_GET_ITEM(keys, i);
+      int present = PyDict_Contains(snapshot, key);
+      if (present < 0 || (!present && PyDict_DelItem(data, key) < 0)) {
+        result = -1;
+        break;
+      }
+    }
+    if (result == 0) {
+      result = PyDict_Update(data, snapshot);
+    }
+    Py_DECREF(keys);
+  }
+  Py_END_CRITICAL_SECTION();
+  return result;
+}
+
+static rmw_ret_t reload_environ(void)
+{
+  PyObject *os = PyImport_ImportModule("os");
+  if (!os) {
+    return RMW_RET_ERROR;
+  }
+  /* CPython's os.reload_environ uses the same snapshot and shared cache.
+   * Keep os.environ and os.environb in sync without clearing unrelated keys.
+   * Snapshotting the C environment requires no concurrent native writers. */
+  PyObject *environment = PyObject_GetAttrString(os, "environ");
+  PyObject *snapshot = environment ? PyObject_CallMethod(os, "_create_environ", NULL) : NULL;
+  PyObject *data = snapshot ? PyObject_GetAttrString(environment, "_data") : NULL;
+  int result = -1;
+  if (data && PyDict_CheckExact(data) && PyDict_CheckExact(snapshot)) {
+#ifdef _WIN32
+    PyObject *normalized = PyDict_New();
+    if (normalized) {
+      PyObject *key;
+      PyObject *value;
+      Py_ssize_t pos = 0;
+      result = 0;
+      while (PyDict_Next(snapshot, &pos, &key, &value)) {
+        PyObject *encoded = PyObject_CallMethod(environment, "encodekey", "O", key);
+        if (!encoded) {
+          result = -1;
+          break;
+        }
+        result = PyDict_SetItem(normalized, encoded, value);
+        Py_DECREF(encoded);
+        if (result < 0) {
+          break;
+        }
+      }
+      if (result == 0) {
+        result = update_environment_cache(data, normalized);
+      }
+      Py_DECREF(normalized);
+    }
+#else
+    result = update_environment_cache(data, snapshot);
+#endif
+  }
+  Py_XDECREF(data);
+  Py_XDECREF(snapshot);
+  Py_XDECREF(environment);
+  Py_DECREF(os);
+  return result == 0 ? RMW_RET_OK : RMW_RET_ERROR;
+}
+
+#else
+
 static rcutils_ret_t add_py_string_to_list(PyObject *py_str, rcutils_array_list_t *list)
 {
   Py_ssize_t str_size;
@@ -312,40 +391,42 @@ static rmw_ret_t reload_environ(void)
   return rmw_convert_rcutils_ret_to_rmw_ret(ret);
 }
 
+#endif
+
+static PyObject *
+apply_isolation(rmw_ret_t (*operation)(void), const char * action)
+{
+#if PY_VERSION_HEX >= 0x030E0000
+  PyMutex_Lock(&isolation_mutex);
+#endif
+  const rmw_ret_t native_result = operation();
+  const rmw_ret_t reload_result = RMW_RET_OK == native_result ? reload_environ() : RMW_RET_OK;
+#if PY_VERSION_HEX >= 0x030E0000
+  PyMutex_Unlock(&isolation_mutex);
+#endif
+  if (RMW_RET_OK != native_result) {
+    PyErr_Format(PyExc_RuntimeError, "Failed to %s RMW isolation (%d)", action, native_result);
+    return NULL;
+  }
+  if (RMW_RET_OK != reload_result) {
+    if (!PyErr_Occurred()) {
+      PyErr_Format(PyExc_RuntimeError, "Failed to reload environment (%d)", reload_result);
+    }
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
 static PyObject *
 isolation_start(PyObject * Py_UNUSED(self), PyObject * Py_UNUSED(args))
 {
-  rmw_ret_t ret = rmw_test_isolation_start();
-  if (RMW_RET_OK != ret) {
-    PyErr_Format(PyExc_RuntimeError, "Failed to start RMW isolation (%d)", ret);
-    return NULL;
-  }
-
-  ret = reload_environ();
-  if (ret) {
-    PyErr_Format(PyExc_RuntimeError, "Failed to reload environment (%u)", ret);
-    return NULL;
-  }
-
-  Py_RETURN_NONE;
+  return apply_isolation(rmw_test_isolation_start, "start");
 }
 
 static PyObject *
 isolation_stop(PyObject * Py_UNUSED(self), PyObject * Py_UNUSED(args))
 {
-  rmw_ret_t ret = rmw_test_isolation_stop();
-  if (RMW_RET_OK != ret) {
-    PyErr_Format(PyExc_RuntimeError, "Failed to stop RMW isolation (%d)", ret);
-    return NULL;
-  }
-
-  ret = reload_environ();
-  if (ret) {
-    PyErr_Format(PyExc_RuntimeError, "Failed to reload environment (%d)", ret);
-    return NULL;
-  }
-
-  Py_RETURN_NONE;
+  return apply_isolation(rmw_test_isolation_stop, "stop");
 }
 
 static PyMethodDef module_methods[] = {
@@ -369,5 +450,12 @@ static struct PyModuleDef module = {
 PyMODINIT_FUNC
 PyInit__rmw_test_fixture_implementation(void)
 {
-  return PyModule_Create(&module);
+  PyObject *result = PyModule_Create(&module);
+#if defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030E0000
+  if (result && PyUnstable_Module_SetGIL(result, Py_MOD_GIL_NOT_USED) < 0) {
+    Py_DECREF(result);
+    return NULL;
+  }
+#endif
+  return result;
 }
